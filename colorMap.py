@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import sys
 import math
 import re
@@ -5,6 +6,9 @@ from collections import Counter
 
 import numpy as np
 
+# ---------------------------
+# 1) LOAD X/Y AND Z (UNCHANGED LOGIC)
+# ---------------------------
 def load_xy_from_table1(path="table1.txt"):
     # A = col 0 (Y), B = col 1 (X); skip the header row
     y, x = np.genfromtxt(
@@ -283,10 +287,15 @@ class EnhancedBCWindow(QtWidgets.QMainWindow):
     """
     Enhanced brightness/contrast window with pyqtgraph, now using table1/table2 extents.
     """
-    def __init__(self, data, x_range, y_range, cmap='viridis', vmin=None, vmax=None, parent=None):
+    def __init__(self, data, x_range, y_range, cmap='viridis', vmin=None, vmax=None, 
+                 xy_file="table1.txt", z_file="table2.txt", parent=None):
         super().__init__(parent)
         self.setWindowTitle("Interactive Heatmap with Brightness/Contrast (table1/table2)")
         self.resize(1200, 750)
+        
+        # Store file paths
+        self.xy_file = xy_file
+        self.z_file = z_file
         
         # Dark theme
         self.setStyleSheet("""
@@ -355,6 +364,22 @@ class EnhancedBCWindow(QtWidgets.QMainWindow):
         reset_btn = QtWidgets.QPushButton("Reset All Values")
         reset_btn.clicked.connect(self.reset_values)
         left_panel.addWidget(reset_btn)
+        
+        # File selection buttons
+        left_panel.addWidget(QtWidgets.QLabel(""))  # Spacer
+        file_label = QtWidgets.QLabel("Data Files:")
+        file_label.setStyleSheet("font-weight: bold; font-size: 11px; color: #e0e0e0;")
+        left_panel.addWidget(file_label)
+        
+        self.xy_btn = QtWidgets.QPushButton("Select X/Y File")
+        self.xy_btn.setToolTip(f"Current: {self.xy_file}")
+        self.xy_btn.clicked.connect(self.select_xy_file)
+        left_panel.addWidget(self.xy_btn)
+        
+        self.z_btn = QtWidgets.QPushButton("Select Color Matrix File")
+        self.z_btn.setToolTip(f"Current: {self.z_file}")
+        self.z_btn.clicked.connect(self.select_z_file)
+        left_panel.addWidget(self.z_btn)
         
         self.stats_label = QtWidgets.QLabel()
         self.stats_label.setStyleSheet("font-size: 10px; color: #a0a0a0; padding: 5px;")
@@ -500,12 +525,114 @@ class EnhancedBCWindow(QtWidgets.QMainWindow):
             event.accept()
         else:
             super().keyPressEvent(event)
+    
+    def select_xy_file(self):
+        """Open dialog to select X/Y data file"""
+        filename, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select X/Y Data File",
+            "",
+            "Text Files (*.txt);;All Files (*)"
+        )
+        if filename:
+            try:
+                # Try to load the file
+                y, x = load_xy_from_table1(filename)
+                self.xy_file = filename
+                self.xy_btn.setToolTip(f"Current: {self.xy_file}")
+                # Reload visualization with new data
+                self.reload_data()
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Error Loading File",
+                    f"Failed to load X/Y data:\n{str(e)}"
+                )
+    
+    def select_z_file(self):
+        """Open dialog to select color matrix file"""
+        filename, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select Color Matrix File",
+            "",
+            "Text Files (*.txt);;All Files (*)"
+        )
+        if filename:
+            try:
+                # Try to load the file
+                Z = load_ragged_numeric_matrix(filename)
+                self.z_file = filename
+                self.z_btn.setToolTip(f"Current: {self.z_file}")
+                # Reload visualization with new data
+                self.reload_data()
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Error Loading File",
+                    f"Failed to load color matrix data:\n{str(e)}"
+                )
+    
+    def reload_data(self):
+        """Reload data from current files and update visualization"""
+        try:
+            # Load data
+            y, x = load_xy_from_table1(self.xy_file)
+            Z = load_ragged_numeric_matrix(self.z_file)
+            
+            # Update data
+            self.data = Z
+            xmin, xmax = float(np.nanmin(x)), float(np.nanmax(x))
+            ymin, ymax = float(np.nanmin(y)), float(np.nanmax(y))
+            self.xmin, self.xmax = xmin, xmax
+            self.ymin, self.ymax = ymin, ymax
+            
+            # Update base values
+            self.base_vmin = float(np.nanmin(self.data))
+            self.base_vmax = float(np.nanmax(self.data))
+            self.span = max(1e-12, self.base_vmax - self.base_vmin)
+            
+            # Reset brightness/contrast
+            self.contrast = 1.0
+            self.brightness = 0.0
+            self.pad.updateValues(self.contrast, self.brightness)
+            self.pad.span = self.span
+            
+            # Update image
+            self.img_item.setImage(self.data)
+            rect = QtCore.QRectF(self.xmin, self.ymin, 
+                                 (self.xmax - self.xmin), 
+                                 (self.ymax - self.ymin))
+            self.img_item.setRect(rect)
+            
+            # Update colorbar
+            self.cbar.setLevels((self.base_vmin, self.base_vmax))
+            
+            # Update plot ranges
+            self.plot.setXRange(self.xmin, self.xmax, padding=0.0)
+            self.plot.setYRange(self.ymin, self.ymax, padding=0.0)
+            
+            # Update stats and info
+            self._update_stats()
+            self._apply_levels()
+            
+            # Show success message
+            self.info.setText(f"Data reloaded successfully from {self.xy_file} and {self.z_file}")
+            
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Error Reloading Data",
+                f"Failed to reload data:\n{str(e)}"
+            )
 
 
 def main():
     # ---- Load data just like your matplotlib script ----
-    y, x = load_xy_from_table1("table1.txt")
-    Z = load_ragged_numeric_matrix("table2.txt")
+    xy_file = "table1.txt"
+    z_file = "table2.txt"
+    
+    y, x = load_xy_from_table1(xy_file)
+    Z = load_ragged_numeric_matrix(z_file)
     # extent = [xmin, xmax, ymin, ymax]
     xmin, xmax = float(np.nanmin(x)), float(np.nanmax(x))
     ymin, ymax = float(np.nanmin(y)), float(np.nanmax(y))
@@ -527,7 +654,9 @@ def main():
         y_range=(ymin, ymax),
         cmap='viridis',
         vmin=vmin,
-        vmax=vmax
+        vmax=vmax,
+        xy_file=xy_file,
+        z_file=z_file
     )
     win.show()
     
