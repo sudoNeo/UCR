@@ -1,53 +1,167 @@
-#!/usr/bin/env python3
 import sys
 import math
 import re
+import os
 from collections import Counter
+from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 import numpy as np
 
 # ---------------------------
-# 1) LOAD X/Y AND Z (UNCHANGED LOGIC)
+# CONSTANTS
 # ---------------------------
-def load_xy_from_table1(path="table1.txt"):
-    # A = col 0 (Y), B = col 1 (X); skip the header row
-    y, x = np.genfromtxt(
-        path,
-        dtype=float,
-        skip_header=1,
-        usecols=(0, 1),
-        unpack=True,
-        autostrip=True,
-        invalid_raise=False,  # be tolerant if a weird row appears
-    )
-    return y, x
+DEFAULT_XY_FILE = "table1.txt"
+DEFAULT_Z_FILE = "table2.txt"
+CONTROL_PAD_SIZE = 250
+CONTROL_PAD_FPS = 60
+MAIN_UPDATE_FPS = 30
+DEFAULT_KC = -0.01
+DEFAULT_KB = 0.002
+DEFAULT_CMAP = 'viridis'
 
-def load_ragged_numeric_matrix(path="table2.txt"):
-    rows, widths = [], []
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = re.split(r"\s+", line)   # spaces/tabs
-            vals = []
-            for p in parts:
+# ---------------------------
+# 1) FILE I/O CLASS
+# ---------------------------
+class DataLoader:
+    """Dedicated class for file I/O operations"""
+    
+    @staticmethod
+    def detect_columns(path):
+        """Detect the number and names of columns in a data file"""
+        try:
+            with open(path, 'r') as f:
+                # Read header line
+                header = f.readline().strip()
+                
+                # Try to parse header
+                if header:
+                    # Split by common delimiters
+                    parts = re.split(r'[,\t\s]+', header)
+                    # Filter out empty parts
+                    parts = [p.strip() for p in parts if p.strip()]
+                    
+                    # Check if header contains numbers (likely not a header)
+                    try:
+                        float(parts[0])
+                        # First line is data, not header
+                        return len(parts), [f"Column {i}" for i in range(len(parts))]
+                    except:
+                        # First line is header
+                        return len(parts), parts
+                
+                # If no header, count columns in first data line
+                line = f.readline().strip()
+                if line:
+                    parts = re.split(r'[,\t\s]+', line)
+                    parts = [p for p in parts if p.strip()]
+                    return len(parts), [f"Column {i}" for i in range(len(parts))]
+                
+                return 0, []
+        except:
+            return 0, []
+    
+    @staticmethod
+    def load_xy_data(path, x_col=1, y_col=0):
+        """Load X/Y data with column selection"""
+        try:
+            # First detect the actual number of columns
+            with open(path, 'r') as f:
+                # Skip header if present
+                first_line = f.readline().strip()
+                # Check if first line is header or data
                 try:
-                    vals.append(float(p))
-                except ValueError:
-                    pass
-            if vals:
-                rows.append(vals)
-                widths.append(len(vals))
-    if not rows:
-        raise ValueError("table2: no numeric rows found")
-    modal_w, _ = Counter(widths).most_common(1)[0]
-    good = [r for r in rows if len(r) == modal_w]
-    A = np.asarray(good, dtype=np.float64)
-    # Ensure (ny, nx) with ny << nx, e.g., (181, 25999)
-    if A.shape[0] > A.shape[1]:
-        A = A.T
-    return A
+                    float(first_line.split()[0])
+                    skiprows = 0
+                except:
+                    skiprows = 1
+            
+            # Load all data
+            data = np.loadtxt(path, skiprows=skiprows, dtype=np.float64, ndmin=2)
+            if data.size == 0:
+                raise ValueError("No data found in file")
+            
+            # Handle single column case
+            if data.ndim == 1:
+                data = data.reshape(-1, 1)
+            
+            # Validate column indices
+            num_cols = data.shape[1]
+            if x_col >= num_cols:
+                x_col = min(x_col, num_cols - 1)
+            if y_col >= num_cols:
+                y_col = min(y_col, num_cols - 1)
+            
+            return data[:, y_col], data[:, x_col]  # y, x
+        except Exception as e:
+            # Fallback to more flexible parsing
+            try:
+                y, x = np.genfromtxt(
+                    path,
+                    dtype=np.float64,
+                    skip_header=1,
+                    usecols=(y_col, x_col),
+                    unpack=True,
+                    autostrip=True,
+                    invalid_raise=False,
+                )
+                return y, x
+            except:
+                # If all else fails, try default columns
+                y, x = np.genfromtxt(
+                    path,
+                    dtype=np.float64,
+                    skip_header=1,
+                    usecols=(0, min(1, 0)),
+                    unpack=True,
+                    autostrip=True,
+                    invalid_raise=False,
+                )
+                return y, x
+    
+    @staticmethod
+    def load_matrix_data(path):
+        """Optimized matrix loading with better memory usage"""
+        # First pass: determine dimensions
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+        
+        if not lines:
+            raise ValueError("No numeric rows found in file")
+        
+        # Parse all rows at once
+        rows = []
+        for line in lines:
+            try:
+                # Try fast numpy parsing first
+                row = np.fromstring(line, sep=' ', dtype=np.float64)
+                if row.size > 0:
+                    rows.append(row)
+            except:
+                # Fallback to regex parsing
+                parts = re.split(r"\s+", line)
+                vals = []
+                for p in parts:
+                    try:
+                        vals.append(float(p))
+                    except ValueError:
+                        pass
+                if vals:
+                    rows.append(np.array(vals, dtype=np.float64))
+        
+        # Find modal width efficiently
+        widths = np.array([len(r) for r in rows])
+        modal_w = np.bincount(widths).argmax()
+        
+        # Filter and convert to array efficiently
+        good_rows = [r for r, w in zip(rows, widths) if w == modal_w]
+        A = np.vstack(good_rows).astype(np.float64)
+        
+        # Ensure (ny, nx) with ny << nx
+        if A.shape[0] > A.shape[1]:
+            A = A.T
+        return A
 
 # ---------------------------
 # 2) UI (PyQtGraph) IMPLEMENTATION
@@ -60,17 +174,92 @@ except ImportError:
     Signal = QtCore.Signal
 
 import pyqtgraph as pg
-import pyqtgraph.exporters  # for PNG export
+import pyqtgraph.exporters
 
-class AdvancedControlPad(QtWidgets.QWidget):
+
+class ColumnSelectionDialog(QtWidgets.QDialog):
+    """Dialog for selecting X and Y columns from a data file"""
+    
+    def __init__(self, filepath, column_names, current_x=1, current_y=0, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Data Columns")
+        self.setModal(True)
+        self.resize(400, 200)
+        
+        # Store selections
+        self.x_column = current_x
+        self.y_column = current_y
+        
+        # Layout
+        layout = QtWidgets.QVBoxLayout(self)
+        
+        # File info
+        file_label = QtWidgets.QLabel(f"File: {os.path.basename(filepath)}")
+        file_label.setStyleSheet("font-weight: bold; margin-bottom: 10px;")
+        layout.addWidget(file_label)
+        
+        # Column selection
+        grid = QtWidgets.QGridLayout()
+        
+        # X column
+        grid.addWidget(QtWidgets.QLabel("X Column:"), 0, 0)
+        self.x_combo = QtWidgets.QComboBox()
+        for i, name in enumerate(column_names):
+            self.x_combo.addItem(f"{i}: {name}")
+        self.x_combo.setCurrentIndex(min(current_x, len(column_names) - 1))
+        grid.addWidget(self.x_combo, 0, 1)
+        
+        # Y column
+        grid.addWidget(QtWidgets.QLabel("Y Column:"), 1, 0)
+        self.y_combo = QtWidgets.QComboBox()
+        for i, name in enumerate(column_names):
+            self.y_combo.addItem(f"{i}: {name}")
+        self.y_combo.setCurrentIndex(min(current_y, len(column_names) - 1))
+        grid.addWidget(self.y_combo, 1, 1)
+        
+        layout.addLayout(grid)
+        
+        # Spacer
+        layout.addStretch()
+        
+        # Buttons
+        button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+        )
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+        
+        # Connect signals
+        self.x_combo.currentIndexChanged.connect(self._on_x_changed)
+        self.y_combo.currentIndexChanged.connect(self._on_y_changed)
+    
+    def _on_x_changed(self, index):
+        self.x_column = index
+    
+    def _on_y_changed(self, index):
+        self.y_column = index
+    
+    def get_selections(self):
+        """Return the selected column indices"""
+        return self.x_column, self.y_column
+
+
+class ControlPad(QtWidgets.QWidget):
     """
-    Enhanced interactive pad for brightness & contrast control with visual feedback.
+    Interactive control pad for brightness and contrast adjustment
     """
     changeRequested = Signal(float, float)  # (contrast_factor, brightness_delta)
     
-    def __init__(self, parent=None, kc=-0.01, kb=0.002, span=1.0, accent_color=None):
+    # Class constants
+    MIN_MOVEMENT_THRESHOLD = 1
+    WHEEL_FACTOR_UP = 0.9
+    WHEEL_FACTOR_DOWN = 1.0 / 0.9
+    MARKER_NUDGE = 0.02
+    
+    def __init__(self, parent=None, kc=DEFAULT_KC, kb=DEFAULT_KB, span=1.0, accent_color=None):
         super().__init__(parent)
-        self.setMinimumSize(250, 250)
+        self.setMinimumSize(CONTROL_PAD_SIZE, CONTROL_PAD_SIZE)
         self.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
         self.setFocusPolicy(QtCore.Qt.StrongFocus)
         
@@ -85,8 +274,8 @@ class AdvancedControlPad(QtWidgets.QWidget):
         self._y0 = 0
         
         # Position markers (0-1 normalized)
-        self._u = 0.5  # horizontal (brightness)
-        self._v = 0.5  # vertical (contrast)
+        self._u = 0.5
+        self._v = 0.5
         
         # Current absolute values for display
         self.current_contrast = 1.0
@@ -95,28 +284,58 @@ class AdvancedControlPad(QtWidgets.QWidget):
         # Enable mouse tracking for hover effects
         self.setMouseTracking(True)
         self._hover_pos = None
-        self.accent = accent_color or QtGui.QColor(210, 210, 210)           # neutral gray
+        self.accent = accent_color or QtGui.QColor(210, 210, 210)
         self.accent_dim = QtGui.QColor(self.accent.red(), self.accent.green(), self.accent.blue(), 120)
         self.accent_faint = QtGui.QColor(self.accent.red(), self.accent.green(), self.accent.blue(), 60)
         
+        # Optimization: Update timer for batched redraws
+        self._update_timer = QtCore.QTimer(self)
+        self._update_timer.timeout.connect(self._do_update)
+        self._update_timer.setInterval(1000 // CONTROL_PAD_FPS)
+        self._update_pending = False
+        
+        # Cache frequently used calculations
+        self._cached_geometry = None
+        self._cached_rects = {}
+    
+    def __del__(self):
+        """Cleanup timer on destruction"""
+        if hasattr(self, '_update_timer'):
+            self._update_timer.stop()
+            self._update_timer.deleteLater()
+    
+    def _request_update(self):
+        """Request an update, batching multiple requests"""
+        if not self._update_pending:
+            self._update_pending = True
+            self._update_timer.start()
+    
+    def _do_update(self):
+        """Perform the actual update"""
+        self._update_timer.stop()
+        self._update_pending = False
+        self.update()
+    
     def sizeHint(self):
-        return QtCore.QSize(250, 250)
+        return QtCore.QSize(CONTROL_PAD_SIZE, CONTROL_PAD_SIZE)
+    
+    @lru_cache(maxsize=128)
+    def _calculate_marker_position(self, brightness, contrast):
+        """Cached calculation of marker position from values"""
+        u = np.clip(0.5 + brightness / max(1e-9, self.span), 0.0, 1.0)
+        v = 0.5
+        if contrast > 0:
+            v = np.clip(0.5 - math.log(contrast) / (2 * max(1e-9, abs(self.kc))), 0.0, 1.0)
+        return u, v
     
     def updateValues(self, contrast, brightness):
         """Update displayed values from external source"""
         self.current_contrast = contrast
         self.current_brightness = brightness
         
-        # Update marker position based on values
-        # Brightness: linear mapping
-        self._u = np.clip(0.5 + brightness / max(1e-9, self.span), 0.0, 1.0)
-        
-        # Contrast: inverse exponential mapping
-        if contrast > 0:
-            # Map contrast back to vertical position
-            self._v = np.clip(0.5 - math.log(contrast) / (2 * max(1e-9, abs(self.kc))), 0.0, 1.0)
-        
-        self.update()
+        # Use cached calculation
+        self._u, self._v = self._calculate_marker_position(brightness, contrast)
+        self._request_update()
     
     def mousePressEvent(self, event):
         if event.button() in (QtCore.Qt.LeftButton, QtCore.Qt.RightButton):
@@ -124,37 +343,42 @@ class AdvancedControlPad(QtWidgets.QWidget):
             self._button = event.button()
             self._x0, self._y0 = event.x(), event.y()
             self._updateMarker(event.x(), event.y())
-            self.update()
+            self.update()  # Immediate update on press
     
     def mouseMoveEvent(self, event):
         self._hover_pos = (event.x(), event.y())
         
         if not self._dragging:
-            self.update()  # Update hover effect
+            self._request_update()  # Batched update for hover
             return
         
         dx = event.x() - self._x0
         dy = event.y() - self._y0
         
+        # Skip tiny movements
+        if abs(dx) < self.MIN_MOVEMENT_THRESHOLD and abs(dy) < self.MIN_MOVEMENT_THRESHOLD:
+            return
+        
         contrast_factor = 1.0
         brightness_delta = 0.0
         
         if self._button == QtCore.Qt.LeftButton:
-            # Left drag: both contrast (vertical) and brightness (horizontal)
             contrast_factor = math.exp(self.kc * dy)
             brightness_delta = self.kb * dx * self.span
         elif self._button == QtCore.Qt.RightButton:
-            # Right drag: brightness only (vertical)
             brightness_delta = -self.kb * dy * self.span
         
         self._x0, self._y0 = event.x(), event.y()
         self._updateMarker(event.x(), event.y())
         
-        # Update current values for display
+        # Update current values
         self.current_contrast *= contrast_factor
         self.current_brightness += brightness_delta
         
-        self.update()
+        # Clear cache when values change
+        self._calculate_marker_position.cache_clear()
+        
+        self._request_update()
         self.changeRequested.emit(contrast_factor, brightness_delta)
     
     def mouseReleaseEvent(self, event):
@@ -164,26 +388,34 @@ class AdvancedControlPad(QtWidgets.QWidget):
     
     def mouseDoubleClickEvent(self, event):
         """Reset on double-click"""
+        old_contrast = self.current_contrast
+        old_brightness = self.current_brightness
+        
         self._u = 0.5
         self._v = 0.5
         self.current_contrast = 1.0
         self.current_brightness = 0.0
+        
+        # Clear cache
+        self._calculate_marker_position.cache_clear()
+        
         self.update()
-        self.changeRequested.emit(1.0, 0.0)  # Ensure exact reset
+        # Emit the change needed to reset
+        if old_contrast != 0:
+            self.changeRequested.emit(1.0 / old_contrast, -old_brightness)
     
     def wheelEvent(self, event):
         delta = event.angleDelta().y()
-        factor = 0.9 if delta > 0 else (1 / 0.9)
+        factor = self.WHEEL_FACTOR_UP if delta > 0 else self.WHEEL_FACTOR_DOWN
         self.current_contrast *= factor
         self.changeRequested.emit(factor, 0.0)
         
-        # Visual feedback: nudge marker
-        self._v = np.clip(self._v + (-0.02 if delta > 0 else 0.02), 0.0, 1.0)
-        self.update()
+        self._v = np.clip(self._v + (-self.MARKER_NUDGE if delta > 0 else self.MARKER_NUDGE), 0.0, 1.0)
+        self._request_update()
     
     def leaveEvent(self, event):
         self._hover_pos = None
-        self.update()
+        self._request_update()
     
     def _updateMarker(self, x, y):
         w = max(1, self.width())
@@ -191,27 +423,46 @@ class AdvancedControlPad(QtWidgets.QWidget):
         self._u = np.clip(x / w, 0.0, 1.0)
         self._v = np.clip(y / h, 0.0, 1.0)
     
+    def resizeEvent(self, event):
+        """Cache geometry calculations on resize"""
+        super().resizeEvent(event)
+        self._cached_geometry = None
+        self._cached_rects = {}
+        # Clear position cache as span might affect calculations
+        self._calculate_marker_position.cache_clear()
+    
     def paintEvent(self, event):
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.Antialiasing, True)
         rect = self.rect()
         
-        # Background gradient (subtle)
+        # Cache geometry if needed
+        if self._cached_geometry is None:
+            self._cached_geometry = (rect.width(), rect.height())
+            self._cached_rects = {
+                'value': QtCore.QRect(rect.right() - 120, rect.bottom() - 45, 110, 35),
+                'adjusted': rect.adjusted(1, 1, -1, -1),
+                'text': rect.adjusted(8, 8, -8, -8),
+                'bottom_text': rect.adjusted(8, -25, -8, -8)
+            }
+        
+        w, h = self._cached_geometry
+        
+        # Background gradient
         gradient = QtGui.QLinearGradient(rect.topLeft(), rect.bottomRight())
         gradient.setColorAt(0, QtGui.QColor(40, 40, 45))
         gradient.setColorAt(1, QtGui.QColor(25, 25, 30))
         p.fillRect(rect, QtGui.QBrush(gradient))
         
-        w, h = rect.width(), rect.height()
-        
-        # Grid lines
+        # Grid lines (optimized loop)
         pen_grid = QtGui.QPen(QtGui.QColor(60, 60, 65), 1, QtCore.Qt.DotLine)
         p.setPen(pen_grid)
-        for i in range(1, 10):
-            if i == 5:
-                continue
-            x = rect.left() + i * w / 10.0
-            y = rect.top() + i * h / 10.0
+        
+        # Use list comprehension for efficiency
+        grid_lines = [(i, rect.left() + i * w / 10.0, rect.top() + i * h / 10.0) 
+                      for i in range(1, 10) if i != 5]
+        
+        for i, x, y in grid_lines:
             p.drawLine(int(x), rect.top(), int(x), rect.bottom())
             p.drawLine(rect.left(), int(y), rect.right(), int(y))
         
@@ -242,7 +493,8 @@ class AdvancedControlPad(QtWidgets.QWidget):
         
         # Marker circle
         pen_marker = QtGui.QPen(self.accent, 2)
-        brush_marker = QtGui.QBrush(QtGui.QColor(self.accent.red(), self.accent.green(), self.accent.blue(), 200))
+        brush_marker = QtGui.QBrush(QtGui.QColor(self.accent.red(), self.accent.green(), 
+                                                 self.accent.blue(), 200))
         p.setPen(pen_marker)
         p.setBrush(brush_marker)
         p.drawEllipse(QtCore.QPoint(cx, cy), 6, 6)
@@ -251,12 +503,14 @@ class AdvancedControlPad(QtWidgets.QWidget):
         p.setPen(QtGui.QColor(200, 200, 210))
         font = QtGui.QFont("Arial", 10, QtGui.QFont.Bold)
         p.setFont(font)
-        p.drawText(rect.adjusted(8, 8, -8, -8),
+        p.drawText(self._cached_rects['text'],
                   QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft,
                   " CONTROL PAD")
-        p.drawText(rect.adjusted(8, -25, -8, -8),
+        p.drawText(self._cached_rects['bottom_text'],
                   QtCore.Qt.AlignBottom | QtCore.Qt.AlignLeft,
                   "← Brightness →")
+        
+        # Rotated text
         p.save()
         p.translate(15, rect.center().y())
         p.rotate(-90)
@@ -268,7 +522,7 @@ class AdvancedControlPad(QtWidgets.QWidget):
         # Current values box
         font.setPointSize(9)
         p.setFont(font)
-        value_rect = QtCore.QRect(rect.right() - 120, rect.bottom() - 45, 110, 35)
+        value_rect = self._cached_rects['value']
         p.fillRect(value_rect, QtGui.QColor(20, 20, 25, 200))
         p.setPen(QtGui.QColor(100, 100, 110))
         p.drawRect(value_rect)
@@ -280,24 +534,112 @@ class AdvancedControlPad(QtWidgets.QWidget):
         # Border
         pen_border = QtGui.QPen(QtGui.QColor(80, 80, 90), 2)
         p.setPen(pen_border)
-        p.drawRect(rect.adjusted(1, 1, -1, -1))
+        p.drawRect(self._cached_rects['adjusted'])
 
 
-class EnhancedBCWindow(QtWidgets.QMainWindow):
-    """
-    Enhanced brightness/contrast window with pyqtgraph, now using table1/table2 extents.
-    """
-    def __init__(self, data, x_range, y_range, cmap='viridis', vmin=None, vmax=None, 
-                 xy_file="table1.txt", z_file="table2.txt", parent=None):
+class FileLoadThread(QtCore.QThread):
+    """Thread for async file loading"""
+    progress = Signal(int)
+    finished = Signal(object)  # Will emit the loaded data
+    error = Signal(str)
+    
+    def __init__(self, filename, load_func, parent=None, **kwargs):
         super().__init__(parent)
-        self.setWindowTitle("Interactive Heatmap with Brightness/Contrast (table1/table2)")
-        self.resize(1200, 750)
+        self.filename = filename
+        self.load_func = load_func
+        self.kwargs = kwargs
+    
+    def run(self):
+        try:
+            self.progress.emit(30)
+            data = self.load_func(self.filename, **self.kwargs)
+            self.progress.emit(90)
+            self.finished.emit(data)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class InteractiveHeatmapWindow(QtWidgets.QMainWindow):
+    """
+    Interactive heatmap window with brightness/contrast controls and column selection
+    """
+    
+    # Class constants
+    DEFAULT_WIDTH = 1200
+    DEFAULT_HEIGHT = 750
+    LEVEL_UPDATE_INTERVAL = 1000 // MAIN_UPDATE_FPS
+    PROGRESS_HIDE_DELAY = 500
+    
+    def __init__(self, data, x_range, y_range, cmap=DEFAULT_CMAP, vmin=None, vmax=None, 
+                 xy_file=DEFAULT_XY_FILE, z_file=DEFAULT_Z_FILE, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Interactive Heatmap Viewer")
+        self.resize(self.DEFAULT_WIDTH, self.DEFAULT_HEIGHT)
         
         # Store file paths
         self.xy_file = xy_file
         self.z_file = z_file
         
-        # Dark theme
+        # Column selection
+        self.x_column = 1  # Default: column 1 for X
+        self.y_column = 0  # Default: column 0 for Y
+        
+        # Data loader
+        self.data_loader = DataLoader()
+        
+        # Thread pool for concurrent operations
+        self.thread_pool = ThreadPoolExecutor(max_workers=2)
+        
+        # Active loading threads
+        self.active_threads = []
+        
+        # Apply dark theme
+        self._apply_dark_theme()
+        
+        # Initialize data
+        self.data = np.asarray(data, dtype=np.float64)
+        if vmin is None: vmin = float(np.nanmin(self.data))
+        if vmax is None: vmax = float(np.nanmax(self.data))
+        self.base_vmin = float(vmin)
+        self.base_vmax = float(vmax)
+        self.span = max(1e-12, self.base_vmax - self.base_vmin)
+        
+        self.contrast = 1.0
+        self.brightness = 0.0
+        self.kc = DEFAULT_KC
+        self.kb = DEFAULT_KB
+
+        self.xmin, self.xmax = map(float, x_range)
+        self.ymin, self.ymax = map(float, y_range)
+        
+        # Optimization: Update timer for batched level updates
+        self._level_update_timer = QtCore.QTimer(self)
+        self._level_update_timer.timeout.connect(self._apply_levels_batched)
+        self._level_update_timer.setInterval(self.LEVEL_UPDATE_INTERVAL)
+        self._level_update_pending = False
+        
+        # Setup UI
+        self._setup_ui()
+    
+    def __del__(self):
+        """Cleanup resources"""
+        # Stop timers
+        if hasattr(self, '_level_update_timer'):
+            self._level_update_timer.stop()
+            self._level_update_timer.deleteLater()
+        
+        # Stop threads
+        for thread in self.active_threads:
+            if thread.isRunning():
+                thread.quit()
+                thread.wait()
+        
+        # Shutdown thread pool
+        if hasattr(self, 'thread_pool'):
+            self.thread_pool.shutdown(wait=True)
+    
+    def _apply_dark_theme(self):
+        """Apply dark theme styling"""
         self.setStyleSheet("""
             QMainWindow { background-color: #1e1e1e; }
             QLabel { color: #e0e0e0; }
@@ -307,25 +649,15 @@ class EnhancedBCWindow(QtWidgets.QMainWindow):
             }
             QPushButton:hover { background-color: #4a4a4a; }
             QPushButton:pressed { background-color: #2a2a2a; }
+            QProgressBar {
+                border: 1px solid #555; border-radius: 3px;
+                text-align: center; background-color: #2a2a2a;
+            }
+            QProgressBar::chunk { background-color: #4a90e2; }
         """)
-        
-        self.data = np.asarray(data)
-        # If vmin/vmax not provided, derive from data (like matplotlib colorbar)
-        if vmin is None: vmin = float(np.nanmin(self.data))
-        if vmax is None: vmax = float(np.nanmax(self.data))
-        self.base_vmin = float(vmin)
-        self.base_vmax = float(vmax)
-        self.span = max(1e-12, self.base_vmax - self.base_vmin)
-        
-        self.contrast = 1.0
-        self.brightness = 0.0
-        self.kc = -0.01
-        self.kb = 0.002
-
-        self.xmin, self.xmax = map(float, x_range)
-        self.ymin, self.ymax = map(float, y_range)
-        
-        # Main layout
+    
+    def _setup_ui(self):
+        """Setup UI components"""
         cw = QtWidgets.QWidget(self)
         self.setCentralWidget(cw)
         main_layout = QtWidgets.QHBoxLayout(cw)
@@ -333,6 +665,19 @@ class EnhancedBCWindow(QtWidgets.QMainWindow):
         main_layout.setSpacing(15)
         
         # Left panel
+        left_panel = self._create_left_panel()
+        main_layout.addLayout(left_panel)
+
+        # Right panel with pyqtgraph
+        right_panel = self._create_right_panel()
+        right_container = QtWidgets.QWidget()
+        right_container.setLayout(right_panel)
+        main_layout.addWidget(right_container, 1)
+        
+        self._apply_levels()
+    
+    def _create_left_panel(self):
+        """Create left control panel"""
         left_panel = QtWidgets.QVBoxLayout()
         left_panel.setSpacing(10)
         
@@ -342,7 +687,7 @@ class EnhancedBCWindow(QtWidgets.QMainWindow):
         title_label.setAlignment(QtCore.Qt.AlignCenter)
         left_panel.addWidget(title_label)
         
-        self.pad = AdvancedControlPad(kc=self.kc, kb=self.kb, span=self.span)
+        self.pad = ControlPad(kc=self.kc, kb=self.kb, span=self.span)
         self.pad.changeRequested.connect(self._apply_pad_change)
         left_panel.addWidget(self.pad, 0, QtCore.Qt.AlignTop)
         
@@ -352,7 +697,8 @@ class EnhancedBCWindow(QtWidgets.QMainWindow):
             "• Right-drag: Brightness only\n"
             "• Scroll: Fine-tune contrast\n"
             "• Double-click: Reset to default\n"
-            "• R key: Reset values\n\n"
+            "• R key: Reset values\n"
+            "• S key: Save image\n\n"
             "Plot interactions:\n"
             "• Scroll on plot: Contrast\n"
             "• Drag on plot: Pan view"
@@ -381,15 +727,21 @@ class EnhancedBCWindow(QtWidgets.QMainWindow):
         self.z_btn.clicked.connect(self.select_z_file)
         left_panel.addWidget(self.z_btn)
         
+        # Progress bar for file loading
+        self.progress_bar = QtWidgets.QProgressBar()
+        self.progress_bar.setVisible(False)
+        left_panel.addWidget(self.progress_bar)
+        
         self.stats_label = QtWidgets.QLabel()
         self.stats_label.setStyleSheet("font-size: 10px; color: #a0a0a0; padding: 5px;")
         self._update_stats()
         left_panel.addWidget(self.stats_label)
         
         left_panel.addStretch()
-        main_layout.addLayout(left_panel)
-
-        # Right panel with pyqtgraph
+        return left_panel
+    
+    def _create_right_panel(self):
+        """Create right visualization panel"""
         right_panel = QtWidgets.QVBoxLayout()
         
         self.info = QtWidgets.QLabel(self._fmt_info())
@@ -410,28 +762,40 @@ class EnhancedBCWindow(QtWidgets.QMainWindow):
         self.graph.setBackground('#1e1e1e')
         right_panel.addWidget(self.graph, 1)
         
-        # Plot
+        # Plot with optimizations
         self.plot = self.graph.addPlot(row=0, col=0)
         self.plot.setAspectLocked(False)
         self.plot.setLabel('left', 'Y (table1 Column A)')
         self.plot.setLabel('bottom', 'X (table1 Column B)')
         
-        # Image item; flip vertically to mimic matplotlib origin="lower"
-        img_data = self.data
-        self.img_item = pg.ImageItem(img_data, axisOrder='row-major')
+        # Enable OpenGL for better performance with large datasets
+        try:
+            self.plot.enableGL()
+        except:
+            pass  # OpenGL not available
+        
+        # Image item with optimizations
+        self.img_item = pg.ImageItem(self.data, axisOrder='row-major')
+        self.img_item.setOpts(axisOrder='row-major')
+        
+        # Enable automatic downsampling for performance
+        self.img_item.setAutoDownsample(True)
+        
         self.plot.addItem(self.img_item)
 
-        # Map image to real-world X/Y using setRect
-        rect = QtCore.QRectF(self.xmin, self.ymin, (self.xmax - self.xmin), (self.ymax - self.ymin))
+        # Map image to real-world X/Y
+        rect = QtCore.QRectF(self.xmin, self.ymin, 
+                            (self.xmax - self.xmin), 
+                            (self.ymax - self.ymin))
         self.img_item.setRect(rect)
 
-        # Nice initial view
+        # Set view
         self.plot.setXRange(self.xmin, self.xmax, padding=0.0)
         self.plot.setYRange(self.ymin, self.ymax, padding=0.0)
         
         # Colormap and colorbar
         try:
-            cm = pg.colormap.get(cmap)
+            cm = pg.colormap.get(DEFAULT_CMAP)
         except Exception:
             cm = pg.colormap.get('viridis')
         self.lut = cm.getLookupTable(0.0, 1.0, 256)
@@ -448,37 +812,62 @@ class EnhancedBCWindow(QtWidgets.QMainWindow):
         # Interactions
         self.plot.scene().sigMouseClicked.connect(self._on_plot_click)
         
-        # Add right panel
-        right_container = QtWidgets.QWidget()
-        right_container.setLayout(right_panel)
-        main_layout.addWidget(right_container, 1)
-        
-        self._apply_levels()
+        return right_panel
     
-    # ---- helpers ----
+    @lru_cache(maxsize=256)
+    def _calculate_effective_range(self, vmin, vmax, brightness, contrast):
+        """Cached calculation of effective range"""
+        vmin_p = (vmin - brightness) / max(1e-12, contrast)
+        vmax_p = (vmax - brightness) / max(1e-12, contrast)
+        return vmin_p, vmax_p
+    
     def _fmt_info(self):
-        vmin_p = (self.base_vmin - self.brightness) / max(1e-12, self.contrast)
-        vmax_p = (self.base_vmax - self.brightness) / max(1e-12, self.contrast)
+        vmin_p, vmax_p = self._calculate_effective_range(
+            self.base_vmin, self.base_vmax, self.brightness, self.contrast
+        )
         return (f"Contrast: {self.contrast:.3f}  |  "
                 f"Brightness: {self.brightness:+.3f}  |  "
                 f"Effective Range: [{vmin_p:.3f}, {vmax_p:.3f}]")
     
     def _update_stats(self):
         if self.data.size > 0:
+            # Use cached statistics if available
+            if not hasattr(self, '_stats_cache'):
+                self._stats_cache = {
+                    'min': np.nanmin(self.data),
+                    'max': np.nanmax(self.data),
+                    'mean': np.nanmean(self.data),
+                    'std': np.nanstd(self.data)
+                }
+            
             stats_text = (
                 f"Data Statistics:\n"
                 f"Shape: {self.data.shape}\n"
-                f"Min: {np.nanmin(self.data):.6g}\n"
-                f"Max: {np.nanmax(self.data):.6g}\n"
-                f"Mean: {np.nanmean(self.data):.6g}\n"
-                f"Std: {np.nanstd(self.data):.6g}"
+                f"Min: {self._stats_cache['min']:.6g}\n"
+                f"Max: {self._stats_cache['max']:.6g}\n"
+                f"Mean: {self._stats_cache['mean']:.6g}\n"
+                f"Std: {self._stats_cache['std']:.6g}\n"
+                f"Memory: {self.data.nbytes / 1024 / 1024:.1f} MB"
             )
             self.stats_label.setText(stats_text)
     
+    def _request_level_update(self):
+        """Request a batched level update"""
+        if not self._level_update_pending:
+            self._level_update_pending = True
+            self._level_update_timer.start()
+    
+    def _apply_levels_batched(self):
+        """Apply batched level updates"""
+        self._level_update_timer.stop()
+        self._level_update_pending = False
+        self._apply_levels()
+    
     def _apply_levels(self):
         """Apply brightness and contrast adjustments"""
-        vmin_prime = (self.base_vmin - self.brightness) / max(1e-12, self.contrast)
-        vmax_prime = (self.base_vmax - self.brightness) / max(1e-12, self.contrast)
+        vmin_prime, vmax_prime = self._calculate_effective_range(
+            self.base_vmin, self.base_vmax, self.brightness, self.contrast
+        )
         if vmin_prime > vmax_prime:
             vmin_prime, vmax_prime = vmax_prime, vmin_prime
         
@@ -487,10 +876,14 @@ class EnhancedBCWindow(QtWidgets.QMainWindow):
         self.info.setText(self._fmt_info())
     
     def _apply_pad_change(self, contrast_factor, brightness_delta):
-        """Handle changes from the control pad"""
+        """Handle changes from control pad with batching"""
         self.contrast = max(0.01, self.contrast * float(contrast_factor))
         self.brightness += float(brightness_delta)
-        self._apply_levels()
+        
+        # Clear cache when values change
+        self._calculate_effective_range.cache_clear()
+        
+        self._request_level_update()
         self.pad.updateValues(self.contrast, self.brightness)
     
     def _on_plot_click(self, event):
@@ -501,6 +894,7 @@ class EnhancedBCWindow(QtWidgets.QMainWindow):
         self.contrast = 1.0
         self.brightness = 0.0
         self.pad.updateValues(self.contrast, self.brightness)
+        self._calculate_effective_range.cache_clear()
         self._apply_levels()
     
     def wheelEvent(self, event):
@@ -509,7 +903,8 @@ class EnhancedBCWindow(QtWidgets.QMainWindow):
             factor = 0.9 if delta > 0 else (1 / 0.9)
             self.contrast = max(0.01, self.contrast * factor)
             self.pad.updateValues(self.contrast, self.brightness)
-            self._apply_levels()
+            self._calculate_effective_range.cache_clear()
+            self._request_level_update()
             event.accept()
         else:
             super().wheelEvent(event)
@@ -519,68 +914,192 @@ class EnhancedBCWindow(QtWidgets.QMainWindow):
             self.reset_values()
             event.accept()
         elif event.key() == QtCore.Qt.Key_S:
-            exporter = pg.exporters.ImageExporter(self.plot)
-            exporter.export('brightness_contrast_view.png')
-            self.info.setText("View saved to brightness_contrast_view.png")
+            self._save_image()
             event.accept()
         else:
             super().keyPressEvent(event)
+    
+    def _save_image(self):
+        """Save current view with error handling"""
+        try:
+            base_xy = os.path.splitext(os.path.basename(self.xy_file))[0]
+            base_z = os.path.splitext(os.path.basename(self.z_file))[0]
+            filename = f'heatmap_{base_xy}_{base_z}.png'
+            exporter = pg.exporters.ImageExporter(self.plot)
+            exporter.export(filename)
+            self.info.setText(f"View saved to {filename}")
+        except Exception as e:
+            self.info.setText(f"Save failed: {str(e)}")
     
     def select_xy_file(self):
         """Open dialog to select X/Y data file"""
         filename, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Select X/Y Data File",
-            "",
-            "Text Files (*.txt);;All Files (*)"
+            os.path.dirname(self.xy_file) if self.xy_file else "",
+            "Text Files (*.txt);;CSV Files (*.csv);;All Files (*)"
         )
         if filename:
-            try:
-                # Try to load the file
-                y, x = load_xy_from_table1(filename)
-                self.xy_file = filename
-                self.xy_btn.setToolTip(f"Current: {self.xy_file}")
-                # Reload visualization with new data
-                self.reload_data()
-            except Exception as e:
-                QtWidgets.QMessageBox.critical(
-                    self,
-                    "Error Loading File",
-                    f"Failed to load X/Y data:\n{str(e)}"
-                )
+            self._load_xy_file_async(filename)
     
     def select_z_file(self):
         """Open dialog to select color matrix file"""
         filename, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Select Color Matrix File",
-            "",
-            "Text Files (*.txt);;All Files (*)"
+            os.path.dirname(self.z_file) if self.z_file else "",
+            "Text Files (*.txt);;CSV Files (*.csv);;All Files (*)"
         )
         if filename:
-            try:
-                # Try to load the file
-                Z = load_ragged_numeric_matrix(filename)
-                self.z_file = filename
-                self.z_btn.setToolTip(f"Current: {self.z_file}")
-                # Reload visualization with new data
-                self.reload_data()
-            except Exception as e:
-                QtWidgets.QMessageBox.critical(
-                    self,
-                    "Error Loading File",
-                    f"Failed to load color matrix data:\n{str(e)}"
-                )
+            self._load_z_file_async(filename)
+    
+    def _load_xy_file_async(self, filename):
+        """Load X/Y file asynchronously with column selection"""
+        # First detect columns
+        num_cols, col_names = self.data_loader.detect_columns(filename)
+        if num_cols == 0:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Error",
+                "Could not detect columns in the selected file."
+            )
+            return
+        
+        # Show column selection dialog
+        dialog = ColumnSelectionDialog(
+            filename, col_names, 
+            self.x_column if hasattr(self, 'x_column') else 1,
+            self.y_column if hasattr(self, 'y_column') else 0,
+            self
+        )
+        
+        if dialog.exec_() == QtWidgets.QDialog.Accepted:
+            self.x_column, self.y_column = dialog.get_selections()
+            
+            # Update plot labels
+            self.plot.setLabel('bottom', f'X ({col_names[self.x_column]})')
+            self.plot.setLabel('left', f'Y ({col_names[self.y_column]})')
+            
+            # Now load the file with selected columns
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setValue(0)
+            
+            # Disable button during loading
+            self.xy_btn.setEnabled(False)
+            
+            thread = FileLoadThread(
+                filename, 
+                self.data_loader.load_xy_data, 
+                self,
+                x_col=self.x_column,
+                y_col=self.y_column
+            )
+            thread.progress.connect(self.progress_bar.setValue)
+            thread.finished.connect(lambda data: self._on_xy_loaded(filename, data))
+            thread.error.connect(self._on_xy_load_error)
+            
+            self.active_threads.append(thread)
+            thread.finished.connect(lambda: self.active_threads.remove(thread))
+            thread.start()
+    
+    def _on_xy_loaded(self, filename, data):
+        """Handle successful X/Y data loading"""
+        self.xy_file = filename
+        self.xy_btn.setToolTip(f"Current: {os.path.basename(self.xy_file)}")
+        self.xy_btn.setEnabled(True)
+        self.progress_bar.setValue(100)
+        
+        # Store loaded data temporarily
+        self._pending_xy_data = data
+        self.reload_data()
+        
+        QtCore.QTimer.singleShot(self.PROGRESS_HIDE_DELAY, 
+                                lambda: self.progress_bar.setVisible(False))
+    
+    def _on_xy_load_error(self, error_msg):
+        """Handle X/Y loading error"""
+        self.xy_btn.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        QtWidgets.QMessageBox.critical(
+            self,
+            "Error Loading File",
+            f"Failed to load X/Y data:\n{error_msg}"
+        )
+    
+    def _load_z_file_async(self, filename):
+        """Load color matrix file asynchronously"""
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        
+        # Disable button during loading
+        self.z_btn.setEnabled(False)
+        
+        thread = FileLoadThread(filename, self.data_loader.load_matrix_data, self)
+        thread.progress.connect(self.progress_bar.setValue)
+        thread.finished.connect(lambda data: self._on_z_loaded(filename, data))
+        thread.error.connect(self._on_z_load_error)
+        
+        self.active_threads.append(thread)
+        thread.finished.connect(lambda: self.active_threads.remove(thread))
+        thread.start()
+    
+    def _on_z_loaded(self, filename, data):
+        """Handle successful matrix data loading"""
+        self.z_file = filename
+        self.z_btn.setToolTip(f"Current: {os.path.basename(self.z_file)}")
+        self.z_btn.setEnabled(True)
+        self.progress_bar.setValue(100)
+        
+        # Store loaded data temporarily
+        self._pending_z_data = data
+        self.reload_data()
+        
+        QtCore.QTimer.singleShot(self.PROGRESS_HIDE_DELAY, 
+                                lambda: self.progress_bar.setVisible(False))
+    
+    def _on_z_load_error(self, error_msg):
+        """Handle matrix loading error"""
+        self.z_btn.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        QtWidgets.QMessageBox.critical(
+            self,
+            "Error Loading File",
+            f"Failed to load color matrix data:\n{error_msg}"
+        )
     
     def reload_data(self):
-        """Reload data from current files and update visualization"""
+        """Reload data with optimizations"""
         try:
-            # Load data
-            y, x = load_xy_from_table1(self.xy_file)
-            Z = load_ragged_numeric_matrix(self.z_file)
+            # Clear old data to free memory
+            if hasattr(self, 'data'):
+                del self.data
+            
+            # Use pending data if available, otherwise reload
+            if hasattr(self, '_pending_xy_data'):
+                y, x = self._pending_xy_data
+                del self._pending_xy_data
+            else:
+                y, x = self.data_loader.load_xy_data(
+                    self.xy_file, 
+                    x_col=self.x_column, 
+                    y_col=self.y_column
+                )
+            
+            if hasattr(self, '_pending_z_data'):
+                Z = self._pending_z_data
+                del self._pending_z_data
+            else:
+                Z = self.data_loader.load_matrix_data(self.z_file)
             
             # Update data
-            self.data = Z
+            self.data = Z.astype(np.float64)
+            
+            # Clear caches
+            if hasattr(self, '_stats_cache'):
+                del self._stats_cache
+            self._calculate_effective_range.cache_clear()
+            
+            # Update ranges
             xmin, xmax = float(np.nanmin(x)), float(np.nanmax(x))
             ymin, ymax = float(np.nanmin(y)), float(np.nanmax(y))
             self.xmin, self.xmax = xmin, xmax
@@ -597,11 +1116,11 @@ class EnhancedBCWindow(QtWidgets.QMainWindow):
             self.pad.updateValues(self.contrast, self.brightness)
             self.pad.span = self.span
             
-            # Update image
-            self.img_item.setImage(self.data)
+            # Update image efficiently
+            self.img_item.setImage(self.data, autoLevels=False)
             rect = QtCore.QRectF(self.xmin, self.ymin, 
-                                 (self.xmax - self.xmin), 
-                                 (self.ymax - self.ymin))
+                                (self.xmax - self.xmin), 
+                                (self.ymax - self.ymin))
             self.img_item.setRect(rect)
             
             # Update colorbar
@@ -616,7 +1135,7 @@ class EnhancedBCWindow(QtWidgets.QMainWindow):
             self._apply_levels()
             
             # Show success message
-            self.info.setText(f"Data reloaded successfully from {self.xy_file} and {self.z_file}")
+            self.info.setText(f"Data loaded: {os.path.basename(self.xy_file)} & {os.path.basename(self.z_file)}")
             
         except Exception as e:
             QtWidgets.QMessageBox.critical(
@@ -627,12 +1146,35 @@ class EnhancedBCWindow(QtWidgets.QMainWindow):
 
 
 def main():
-    # ---- Load data just like your matplotlib script ----
-    xy_file = "table1.txt"
-    z_file = "table2.txt"
+    # Load data with data loader
+    loader = DataLoader()
     
-    y, x = load_xy_from_table1(xy_file)
-    Z = load_ragged_numeric_matrix(z_file)
+    # Default column selections
+    x_col = 1
+    y_col = 0
+    
+    try:
+        # Check if file exists and detect columns
+        if os.path.exists(DEFAULT_XY_FILE):
+            num_cols, col_names = loader.detect_columns(DEFAULT_XY_FILE)
+            if num_cols > 0:
+                # Load with default columns
+                y, x = loader.load_xy_data(DEFAULT_XY_FILE, x_col=x_col, y_col=y_col)
+            else:
+                raise ValueError("No columns detected")
+        else:
+            raise FileNotFoundError(f"{DEFAULT_XY_FILE} not found")
+            
+        Z = loader.load_matrix_data(DEFAULT_Z_FILE)
+    except Exception as e:
+        print(f"Error loading default files: {e}")
+        print("Creating demo data...")
+        # Create demo data if files not found
+        x = np.linspace(0, 10, 100)
+        y = np.linspace(0, 10, 100)
+        xx, yy = np.meshgrid(x, y)
+        Z = np.sin(xx) * np.cos(yy)
+    
     # extent = [xmin, xmax, ymin, ymax]
     xmin, xmax = float(np.nanmin(x)), float(np.nanmax(x))
     ymin, ymax = float(np.nanmin(y)), float(np.nanmax(y))
@@ -643,21 +1185,33 @@ def main():
     if app is None:
         app = QtWidgets.QApplication(sys.argv)
         created_app = True
+        
+        # Enable high DPI support
+        try:
+            app.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
+            app.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
+        except:
+            pass  # Older Qt version
     
     # Initial vmin/vmax from data
     vmin = float(np.nanmin(Z))
     vmax = float(np.nanmax(Z))
     
-    win = EnhancedBCWindow(
+    win = InteractiveHeatmapWindow(
         data=Z,
         x_range=(xmin, xmax),
         y_range=(ymin, ymax),
-        cmap='viridis',
+        cmap=DEFAULT_CMAP,
         vmin=vmin,
         vmax=vmax,
-        xy_file=xy_file,
-        z_file=z_file
+        xy_file=DEFAULT_XY_FILE,
+        z_file=DEFAULT_Z_FILE
     )
+    
+    # Set initial column selections
+    win.x_column = x_col
+    win.y_column = y_col
+    
     win.show()
     
     if created_app:
