@@ -6,7 +6,7 @@ from collections import Counter
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 import threading
-
+import argparse
 import numpy as np
 
 # ---------------------------
@@ -67,18 +67,24 @@ class DataLoader:
         """Load X/Y data with column selection"""
         try:
             # First detect the actual number of columns
-            with open(path, 'r') as f:
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
                 # Skip header if present
                 first_line = f.readline().strip()
-                # Check if first line is header or data
+                # Check header 
                 try:
                     float(first_line.split()[0])
                     skiprows = 0
                 except:
                     skiprows = 1
+                if ',' in first_line:
+                    delim = ','
+                elif '\t' in first_line:
+                    delim = '\t'
+                else:
+                    delim = None  # whitespace
             
             # Load all data
-            data = np.loadtxt(path, skiprows=skiprows, dtype=np.float64, ndmin=2)
+            data = np.loadtxt(path, skiprows=skiprows, dtype=np.float64, ndmin=2, delimiter=delim)
             if data.size == 0:
                 raise ValueError("No data found in file")
             
@@ -99,6 +105,7 @@ class DataLoader:
             try:
                 y, x = np.genfromtxt(
                     path,
+                    delimiter=delim,
                     dtype=np.float64,
                     skip_header=1,
                     usecols=(y_col, x_col),
@@ -111,6 +118,7 @@ class DataLoader:
                 # If all else fails, try default columns
                 y, x = np.genfromtxt(
                     path,
+                    delimiter=delim,
                     dtype=np.float64,
                     skip_header=1,
                     usecols=(0, min(1, 0)),
@@ -130,35 +138,44 @@ class DataLoader:
         if not lines:
             raise ValueError("No numeric rows found in file")
         
-        # Parse all rows at once
+        first = lines[0]
+        if ',' in first:
+            sep = ','
+            splitter = re.compile(r"\s*,\s*")
+        elif '\t' in first:
+            sep = '\t'
+            splitter = re.compile(r"\t+")
+        else:
+            sep = ' '  # whitespace
+            splitter = re.compile(r"\s+")
+
         rows = []
         for line in lines:
             try:
-                # Try fast numpy parsing first
-                row = np.fromstring(line, sep=' ', dtype=np.float64)
-                if row.size > 0:
+                row = np.fromstring(line, sep=sep, dtype=np.float64)
+                if row.size:
                     rows.append(row)
-            except:
-                # Fallback to regex parsing
-                parts = re.split(r"\s+", line)
-                vals = []
-                for p in parts:
-                    try:
-                        vals.append(float(p))
-                    except ValueError:
-                        pass
-                if vals:
-                    rows.append(np.array(vals, dtype=np.float64))
-        
-        # Find modal width efficiently
-        widths = np.array([len(r) for r in rows])
+                    continue
+            except Exception:
+                pass
+            # Fallback parser (handles stray spaces/commas)
+            parts = [p for p in splitter.split(line) if p]
+            vals = []
+            for p in parts:
+                try:
+                    vals.append(float(p))
+                except ValueError:
+                    pass
+            if vals:
+                rows.append(np.asarray(vals, dtype=np.float64))
+
+        if not rows:
+            raise ValueError("No numeric rows found in file")
+
+        widths = np.array([r.size for r in rows], dtype=int)
         modal_w = np.bincount(widths).argmax()
-        
-        # Filter and convert to array efficiently
-        good_rows = [r for r, w in zip(rows, widths) if w == modal_w]
+        good_rows = [r for r in rows if r.size == modal_w]
         A = np.vstack(good_rows).astype(np.float64)
-        
-        # Ensure (ny, nx) with ny << nx
         if A.shape[0] > A.shape[1]:
             A = A.T
         return A
@@ -298,11 +315,16 @@ class ControlPad(QtWidgets.QWidget):
         self._cached_geometry = None
         self._cached_rects = {}
     
-    def __del__(self):
-        """Cleanup timer on destruction"""
+    def _cleanup(self):
+        """Cleanup timer resources"""
         if hasattr(self, '_update_timer'):
-            self._update_timer.stop()
-            self._update_timer.deleteLater()
+            try:
+                self._update_timer.stop()
+                # Handle both PyQt5 and PySide6
+                self._update_timer.deleteLater()
+            except (RuntimeError, AttributeError):
+                # Timer might already be deleted
+                pass
     
     def _request_update(self):
         """Request an update, batching multiple requests"""
@@ -430,6 +452,11 @@ class ControlPad(QtWidgets.QWidget):
         self._cached_rects = {}
         # Clear position cache as span might affect calculations
         self._calculate_marker_position.cache_clear()
+    
+    def closeEvent(self, event):
+        """Handle widget close event"""
+        self._cleanup()
+        super().closeEvent(event)
     
     def paintEvent(self, event):
         p = QtGui.QPainter(self)
@@ -598,6 +625,8 @@ class InteractiveHeatmapWindow(QtWidgets.QMainWindow):
         
         # Initialize data
         self.data = np.asarray(data, dtype=np.float64)
+        # Replace any NaN values to avoid rendering issues
+        self.data = np.nan_to_num(self.data, copy=False, nan=0.0)
         if vmin is None: vmin = float(np.nanmin(self.data))
         if vmax is None: vmax = float(np.nanmax(self.data))
         self.base_vmin = float(vmin)
@@ -621,22 +650,40 @@ class InteractiveHeatmapWindow(QtWidgets.QMainWindow):
         # Setup UI
         self._setup_ui()
     
-    def __del__(self):
-        """Cleanup resources"""
+    def _cleanup_resources(self):
+        """Cleanup all resources safely"""
         # Stop timers
         if hasattr(self, '_level_update_timer'):
-            self._level_update_timer.stop()
-            self._level_update_timer.deleteLater()
+            try:
+                self._level_update_timer.stop()
+                # Handle both PyQt5 and PySide6
+                self._level_update_timer.deleteLater()
+            except (RuntimeError, AttributeError):
+                # Timer might already be deleted
+                pass
         
         # Stop threads
-        for thread in self.active_threads:
-            if thread.isRunning():
-                thread.quit()
-                thread.wait()
+        if hasattr(self, 'active_threads'):
+            threads_to_stop = list(self.active_threads)  # Make a copy
+            for thread in threads_to_stop:
+                try:
+                    if thread.isRunning():
+                        thread.quit()
+                        if not thread.wait(1000):  # Wait max 1 second
+                            thread.terminate()
+                            thread.wait()
+                except (RuntimeError, AttributeError):
+                    # Thread might already be deleted
+                    pass
+            # Clear the list
+            self.active_threads.clear()
         
         # Shutdown thread pool
         if hasattr(self, 'thread_pool'):
-            self.thread_pool.shutdown(wait=True)
+            try:
+                self.thread_pool.shutdown(wait=True)
+            except (RuntimeError, AttributeError):
+                pass
     
     def _apply_dark_theme(self):
         """Apply dark theme styling"""
@@ -775,11 +822,13 @@ class InteractiveHeatmapWindow(QtWidgets.QMainWindow):
             pass  # OpenGL not available
         
         # Image item with optimizations
-        self.img_item = pg.ImageItem(self.data, axisOrder='row-major')
+        # Ensure no NaN values that could cause rendering issues
+        clean_data = np.nan_to_num(self.data, copy=True, nan=0.0)
+        self.img_item = pg.ImageItem(clean_data, axisOrder='row-major')
         self.img_item.setOpts(axisOrder='row-major')
         
-        # Enable automatic downsampling for performance
-        self.img_item.setAutoDownsample(True)
+        # Disable auto downsampling to avoid index errors
+        self.img_item.setAutoDownsample(False)
         
         self.plot.addItem(self.img_item)
 
@@ -918,6 +967,11 @@ class InteractiveHeatmapWindow(QtWidgets.QMainWindow):
             event.accept()
         else:
             super().keyPressEvent(event)
+    
+    def closeEvent(self, event):
+        """Handle window close event"""
+        self._cleanup_resources()
+        super().closeEvent(event)
     
     def _save_image(self):
         """Save current view with error handling"""
@@ -1093,6 +1147,8 @@ class InteractiveHeatmapWindow(QtWidgets.QMainWindow):
             
             # Update data
             self.data = Z.astype(np.float64)
+            # Replace any NaN values to avoid rendering issues
+            self.data = np.nan_to_num(self.data, copy=False, nan=0.0)
             
             # Clear caches
             if hasattr(self, '_stats_cache'):
@@ -1116,8 +1172,9 @@ class InteractiveHeatmapWindow(QtWidgets.QMainWindow):
             self.pad.updateValues(self.contrast, self.brightness)
             self.pad.span = self.span
             
-            # Update image efficiently
-            self.img_item.setImage(self.data, autoLevels=False)
+            # Update image efficiently, ensure no NaN values
+            clean_data = np.nan_to_num(self.data, copy=True, nan=0.0)
+            self.img_item.setImage(clean_data, autoLevels=False)
             rect = QtCore.QRectF(self.xmin, self.ymin, 
                                 (self.xmax - self.xmin), 
                                 (self.ymax - self.ymin))
@@ -1145,27 +1202,51 @@ class InteractiveHeatmapWindow(QtWidgets.QMainWindow):
             )
 
 
+def build_arg_parser():
+    p = argparse.ArgumentParser(
+        description="Interactive heatmap viewer (CSV/TSV/space-delimited supported)."
+    )
+    p.add_argument("--xy", dest="xy_file", default=DEFAULT_XY_FILE,
+                   help="Path to XY file (X,Y vectors; header optional).")
+    p.add_argument("--z", dest="z_file", default=DEFAULT_Z_FILE,
+                   help="Path to Z matrix file (rows form image lines).")
+    p.add_argument("--x-col", type=int, default=1,
+                   help="Zero-based column index to use for X (default: 1).")
+    p.add_argument("--y-col", type=int, default=0,
+                   help="Zero-based column index to use for Y (default: 0).")
+    p.add_argument("--cmap", default=DEFAULT_CMAP,
+                   help="Colormap to use (e.g., viridis, plasma, inferno, magma, cividis, gray, jet).")
+    return p
+
+
 def main():
+    # Parse command line arguments
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    
     # Load data with data loader
     loader = DataLoader()
     
-    # Default column selections
-    x_col = 1
-    y_col = 0
+    # Use command line arguments
+    xy_file = args.xy_file
+    z_file = args.z_file
+    x_col = args.x_col
+    y_col = args.y_col
+    cmap = args.cmap
     
     try:
         # Check if file exists and detect columns
-        if os.path.exists(DEFAULT_XY_FILE):
-            num_cols, col_names = loader.detect_columns(DEFAULT_XY_FILE)
+        if os.path.exists(xy_file):
+            num_cols, col_names = loader.detect_columns(xy_file)
             if num_cols > 0:
-                # Load with default columns
-                y, x = loader.load_xy_data(DEFAULT_XY_FILE, x_col=x_col, y_col=y_col)
+                # Load with specified columns
+                y, x = loader.load_xy_data(xy_file, x_col=x_col, y_col=y_col)
             else:
                 raise ValueError("No columns detected")
         else:
-            raise FileNotFoundError(f"{DEFAULT_XY_FILE} not found")
+            raise FileNotFoundError(f"{xy_file} not found")
             
-        Z = loader.load_matrix_data(DEFAULT_Z_FILE)
+        Z = loader.load_matrix_data(z_file)
     except Exception as e:
         print(f"Error loading default files: {e}")
         print("Creating demo data...")
@@ -1178,7 +1259,12 @@ def main():
     # extent = [xmin, xmax, ymin, ymax]
     xmin, xmax = float(np.nanmin(x)), float(np.nanmax(x))
     ymin, ymax = float(np.nanmin(y)), float(np.nanmax(y))
-    
+    # Enable high DPI support
+    try:
+        app.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
+        app.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
+    except:
+        pass  # Older Qt version
     # Create the app/window
     app = QtWidgets.QApplication.instance()
     created_app = False
@@ -1186,12 +1272,7 @@ def main():
         app = QtWidgets.QApplication(sys.argv)
         created_app = True
         
-        # Enable high DPI support
-        try:
-            app.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
-            app.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
-        except:
-            pass  # Older Qt version
+        
     
     # Initial vmin/vmax from data
     vmin = float(np.nanmin(Z))
@@ -1201,16 +1282,19 @@ def main():
         data=Z,
         x_range=(xmin, xmax),
         y_range=(ymin, ymax),
-        cmap=DEFAULT_CMAP,
+        cmap=cmap,
         vmin=vmin,
         vmax=vmax,
-        xy_file=DEFAULT_XY_FILE,
-        z_file=DEFAULT_Z_FILE
+        xy_file=xy_file,
+        z_file=z_file
     )
     
     # Set initial column selections
     win.x_column = x_col
     win.y_column = y_col
+    
+    # Connect aboutToQuit signal for additional cleanup
+    app.aboutToQuit.connect(win._cleanup_resources)
     
     win.show()
     
